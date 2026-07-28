@@ -65,7 +65,7 @@ Neurad Visual LoRA Loader replaces the standard text-based LoRA selection with a
     ```
 2.  Clone this repository:
     ```bash
-    git clone https://github.com/YOUR_USERNAME/Visual-LoRA-Loader.git
+    git clone https://github.com/DarthNeurad/ComfyUI-Visual-LoRA-Loader.git
     ```
 3.  **Restart ComfyUI** completely.
 
