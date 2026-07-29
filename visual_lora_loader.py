@@ -260,21 +260,58 @@ async def get_loras(request):
 @PromptServer.instance.routes.post("/neurad/fetch-single-info")
 async def fetch_single_info(request):
     """
-    MÉTHODE RGTHREE : Calcule le HASH -> Appelle API By-Hash -> Cache dans user/
+    SECURED: Confines path resolution to allowed lora folders using realpath + commonpath.
     """
     try:
         data = await request.json()
         rel_path = data.get("path")
-        if not rel_path: return web.json_response({"error": "No path"}, status=400)
+        
+        if not rel_path:
+            return web.json_response({"error": "No path provided"}, status=400)
+
+        # Security Fix: Normalize the input path to prevent traversal tricks early
+        # os.path.normpath collapses '..' and '.' but doesn't resolve symlinks yet
+        clean_rel_path = os.path.normpath(rel_path)
+        
+        # Reject absolute paths immediately as we expect a relative path from the client
+        if os.path.isabs(clean_rel_path):
+            return web.json_response({"error": "Absolute paths are not allowed"}, status=400)
 
         full_path = None
-        for root in folder_paths.get_folder_paths("loras"):
-            p = os.path.join(root, rel_path)
-            if os.path.exists(p): full_path = p; break
+        lora_folders = folder_paths.get_folder_paths("loras")
         
-        if not full_path: return web.json_response({"error": "File not found"}, status=404)
+        for root in lora_folders:
+            if not os.path.exists(root):
+                continue
+                
+            # Construct the candidate path
+            candidate_path = os.path.join(root, clean_rel_path)
+            
+            # Resolve to absolute real path (resolves symlinks and '..')
+            # If the file doesn't exist, realpath still resolves the directory structure up to the last existing component,
+            # but for strict security, we usually want to ensure the target exists and is within bounds.
+            if not os.path.exists(candidate_path):
+                continue
+                
+            real_candidate = os.path.realpath(candidate_path)
+            real_root = os.path.realpath(root)
+            
+            # Ensure the resolved path starts with the resolved root directory
+            # We add os.sep to prevent matching partial folder names (e.g. /loras vs /loras_private)
+            if real_candidate.startswith(real_root + os.sep) or real_candidate == real_root:
+                # Additional check: ensure it's a file, not a directory
+                if os.path.isfile(real_candidate):
+                    full_path = real_candidate
+                    break
+            else:
+                # Path escapes the root directory
+                logging.warning(f"[Neurad] Blocked path traversal attempt: {rel_path} resolved to {real_candidate}")
+                continue
 
-        # 1. Calcul du Hash (Peut prendre 1-2s pour un gros fichier)
+        if not full_path:
+            return web.json_response({"error": "File not found or access denied"}, status=404)
+
+        # 1. Calcul du Hash
         file_hash = get_sha256_hash(full_path)
         if not file_hash:
             return web.json_response({"error": "Could not calculate hash"}, status=500)
@@ -283,7 +320,8 @@ async def fetch_single_info(request):
         cached_data = load_from_cache(file_hash)
         if cached_data:
             parsed = parse_civitai_response(cached_data)
-            if parsed: return web.json_response({"success": True, "meta": parsed})
+            if parsed:
+                return web.json_response({"success": True, "meta": parsed})
 
         # 3. Fetch API par Hash
         raw_data = fetch_civitai_by_hash(file_hash)
