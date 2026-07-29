@@ -24,7 +24,7 @@ Neurad Visual LoRA Loader replaces the standard text-based LoRA selection with a
 *   **Live Counters:** Each tab displays real-time counts of active vs. inactive LoRAs.
 
 ### 🧠 Metadata Intelligence
-*   **CivitAI Integration:** One-click fetching of metadata (Trigger Words, Recommended Strength, Images) directly from CivitAI.
+*   **CivitAI Integration:** One-click fetching of metadata (Name,Trigger Words, Exemple Images) directly from CivitAI.
 *   **Local Editing:** Override metadata manually. Edit names, set custom cover images, define trigger words, and set strength ranges.
 *   **Dual Persistence:** Data is saved in both browser LocalStorage (for speed) and server-side disk storage (for backup and persistence across sessions).
 
