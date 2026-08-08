@@ -29,31 +29,47 @@ const LocalCache = {
     saveTimeout: null,
 
     /**
-     * Loads data from the browser's LocalStorage into memory.
-     * Handles parsing errors gracefully.
+     * One-time migration: earlier versions mirrored the full cache into
+     * browser LocalStorage on every write, which grows unbounded as the
+     * LoRA library grows and can eat into the browser's per-origin storage
+     * quota (shared with ComfyUI's own workflow-draft autosave), causing
+     * "Failed to save workflow draft" errors.
+     * The on-disk backup (via /neurad/*-localstorage-backup) is the
+     * source of truth now, so we just purge the stale LocalStorage key
+     * if it's still hanging around from before this change.
      */
     load() {
         try {
-            const stored = localStorage.getItem(STORAGE_KEY);
-            if (stored) this.data = JSON.parse(stored);
-        } catch (e) { console.error("[Neurad] LocalStorage load error", e); }
+            if (localStorage.getItem(STORAGE_KEY) !== null) {
+                localStorage.removeItem(STORAGE_KEY);
+                console.log("[Neurad] Removed legacy LocalStorage cache (now using on-disk cache only).");
+            }
+        } catch (e) { console.error("[Neurad] LocalStorage cleanup error", e); }
     },
 
     /**
-     * Saves current memory data to LocalStorage and triggers an asynchronous disk backup.
-     * The disk backup is debounced (delayed) to prevent excessive server requests during rapid updates.
+     * Persists current in-memory data to disk (debounced).
+     * No longer mirrors to LocalStorage — the on-disk backup, read fresh
+     * via restoreFromDisk() at startup, is the single persistence layer.
      */
     save() {
-        try {
-            localStorage.setItem(STORAGE_KEY, JSON.stringify(this.data));
-        } catch (e) { console.error("[Neurad] LocalStorage save error", e); }
-        
-        // Trigger disk backup with a 1-second delay to batch changes
         this.triggerDiskSave();
     },
 
     /** Retrieves a specific item from the cache by key. */
     get(key) { return this.data[key] || null; },
+
+    /**
+     * Removes an item from the cache and triggers a save.
+     * Used to purge stale metadata for LoRAs that no longer exist on disk.
+     * @param {string} key - The LoRA path identifier.
+     */
+    delete(key) {
+        if (Object.prototype.hasOwnProperty.call(this.data, key)) {
+            delete this.data[key];
+            this.save();
+        }
+    },
 
     /**
      * Updates an item in the cache and triggers a save.
@@ -94,18 +110,12 @@ const LocalCache = {
             const result = await resp.json();
             
             if (result.success && result.data && Object.keys(result.data).length > 0) {
-                // Overwrite local memory with server data
+                // Load directly into in-memory cache. Disk is the sole
+                // persistence layer now, so there's nothing to sync back
+                // to LocalStorage.
                 this.data = result.data;
-                
-                // Sync back to LocalStorage for the current session
-                try { 
-                    localStorage.setItem(STORAGE_KEY, JSON.stringify(this.data)); 
-                    console.log("[Neurad] LocalStorage updated from disk.");
-                } catch(e) {
-                    console.warn("[Neurad] Could not write to LocalStorage (Desktop limitation).");
-                }
-                
-                console.log(`[Neurad] SUCCESS: Restored ${Object.keys(this.data).length} items from disk backup.`);
+
+                console.log(`[Neurad] SUCCESS: Loaded ${Object.keys(this.data).length} items from disk cache.`);
             } else {
                 console.log("[Neurad] No disk backup found.");
             }
@@ -284,10 +294,9 @@ function removeLoraFromTab(nodeRef, tabId, loraPath) {
  * 
  * Logic:
  * 1. Determines the base list (Full catalog for "Library"/dynamic tabs, or specific list for custom tabs).
- * 2. Applies Text Filters (Include/Exclude queries).
- *    - Auto-excludes "nsfw" unless explicitly requested in the include query.
- * 3. Applies State Filters (On/Off/Has Meta/No Meta).
- *    - Checks both server metadata and local cache for "has_meta" status.
+ * 2. If "no_tab" filter is active: Filters baseList to keep ONLY LoRAs not present in any custom tab.
+ * 3. Applies Text Filters (Include/Exclude queries).
+ * 4. Applies State Filters (On/Off/Has Meta/No Meta).
  * 
  * @param {Array} catalog - The full list of LoRA objects.
  * @param {Object} nodeRef - The node instance.
@@ -309,6 +318,7 @@ function getLorasForTab(catalog, nodeRef, tabId) {
 
     // Determine base list source
     let baseList = [];
+    
     if (tab.type === "dynamic" || tab.id === "library") {
         baseList = catalog;
     } else {
@@ -317,6 +327,24 @@ function getLorasForTab(catalog, nodeRef, tabId) {
             if (loraObj) baseList.push(loraObj);
         }
     }
+
+    // --- NEW LOGIC: "NO_TAB" FILTER ---
+    // If the "no_tab" filter is active, filter baseList to keep ONLY LoRAs 
+    // that do NOT belong to any custom (non-locked) tab.
+    const isNoTabFilterActive = searchConfig.filters.includes("no_tab");
+    
+    if (isNoTabFilterActive) {
+        baseList = baseList.filter(lora => {
+            const loraPath = lora.relative_path;
+            // Check if this LoRA exists in ANY custom tab
+            const isInCustomTab = config.tabs.some(t => {
+                return !t.locked && t.type === "custom" && t.loras.includes(loraPath);
+            });
+            // Keep only if it is NOT in a custom tab
+            return !isInCustomTab;
+        });
+    }
+    // ----------------------------------
 
     // Process Search Queries
     let query = searchConfig.query.trim().toLowerCase();
@@ -340,8 +368,12 @@ function getLorasForTab(catalog, nodeRef, tabId) {
         searchConfig.filters = [];
     }
 
-    // Return early if no filters are active
-    if (!query && !excludeQuery && activeFilters.length === 0) return baseList;
+    // Check if there are other filters besides "no_tab"
+    const otherFilters = activeFilters.filter(f => f !== "no_tab");
+    
+    // Return early if no other filters are active (Text, On/Off, Meta)
+    // Note: The "no_tab" filter has already been applied to baseList above.
+    if (!query && !excludeQuery && otherFilters.length === 0) return baseList;
 
     return baseList.filter(lora => {
         // 1. Check Cache for metadata status
@@ -381,6 +413,10 @@ function getLorasForTab(catalog, nodeRef, tabId) {
         // Filter 3: State Filters (On/Off/Meta)
         for (let i = 0; i < activeFilters.length; i++) {
             const filter = activeFilters[i];
+            
+            // Skip "no_tab" here as it was already handled above
+            if (filter === "no_tab") continue; 
+
             const currentMap = nodeRef.properties.activeLorasMap || {};
             const isActive = (currentMap[loraKey] || {}).on || false;
 
@@ -637,6 +673,11 @@ function renderSearchBar(nodeRef, container, fullCatalog, onSearchChange) {
     row2.appendChild(createFilterBtn("OFF", null, "off"));
     row2.appendChild(createFilterBtn(null, "ℹ️", "has_meta"));
     row2.appendChild(createFilterBtn(null, "ℹ️", "no_meta"));
+	
+	// --- NEW BUTTON: Unassigned LoRAs Filter ---
+    // Uses "∅" icon to represent "not in any tab"
+    row2.appendChild(createFilterBtn(null, "➖", "no_tab"));
+    // -------------------------------------------
 
     searchBar.appendChild(row1);
     searchBar.appendChild(row2);
@@ -742,16 +783,15 @@ function updateTabCounterInPlace(nodeRef, tabBtn, tab, currentCatalog) {
  * - Supports renaming (double-click), deletion (x button), and creation (+ button).
  * - Implements Drag & Drop for reordering tabs.
  * - Implements Drop Zone logic for accepting LoRA cards from other tabs.
- * - Maintains scroll position during refreshes.
+ * - Maintains scroll position during refreshes (loaded from node properties).
  * 
  * @param {Object} nodeRef - The node instance.
  * @param {HTMLElement} container - Parent DOM element.
  * @param {Array} currentCatalog - The full LoRA catalog.
  * @param {Function} onTabChange - Callback when active tab changes.
  * @param {Function} refreshCallback - Callback to refresh the UI.
- * @param {number} scrollPosition - Horizontal scroll offset to restore.
  */
-function renderTabsBar(nodeRef, container, currentCatalog, onTabChange, refreshCallback, scrollPosition = 0) {
+function renderTabsBar(nodeRef, container, currentCatalog, onTabChange, refreshCallback) {
 
     const config = nodeRef.properties.tabsConfig;
     if (!config || !currentCatalog) {
@@ -767,8 +807,34 @@ function renderTabsBar(nodeRef, container, currentCatalog, onTabChange, refreshC
     tabBar.classList.add('neurad-tab-bar');
     tabBar.style.cssText = `display:flex; align-items:flex-start; gap:2px; padding:0px 10px 0 10px; background:${CONFIG.COLORS.bg_dark}; border-bottom:1px solid ${CONFIG.COLORS.separator_header}; flex-shrink:0; overflow-x:auto; white-space:nowrap; scrollbar-width:thin; scrollbar-color:${CONFIG.COLORS.bg_button} ${CONFIG.COLORS.bg_dark}; position: relative;`;
     
-    // Restore scroll position
-    requestAnimationFrame(() => { tabBar.scrollLeft = scrollPosition; });
+    // RESTORE SCROLL POSITION FROM NODE PROPERTIES
+    // (unless a tab was just created and needs the bar scrolled fully into view)
+    requestAnimationFrame(() => {
+        if (nodeRef._scrollTabsToEnd) {
+            nodeRef._scrollTabsToEnd = false;
+            if (tabBar.scrollWidth > tabBar.clientWidth) {
+                tabBar.scrollLeft = tabBar.scrollWidth - tabBar.clientWidth;
+                config.tabScrollX = tabBar.scrollLeft;
+                saveTabsConfig(nodeRef);
+                return;
+            }
+        }
+        tabBar.scrollLeft = (config.tabScrollX || 0);
+    });
+
+    // SAVE SCROLL POSITION ON CHANGE
+    tabBar.addEventListener('scroll', () => {
+        config.tabScrollX = tabBar.scrollLeft;
+        saveTabsConfig(nodeRef);
+    });
+
+    // MOUSE WHEEL: convert vertical wheel scroll into horizontal tab bar scroll
+    // (wheel up -> scroll left, wheel down -> scroll right)
+    tabBar.addEventListener('wheel', (e) => {
+        if (e.deltaY === 0) return;
+        e.preventDefault();
+        tabBar.scrollLeft += e.deltaY;
+    }, { passive: false });
 
     // Ensure at least the Library tab exists
     if (!config.tabs || config.tabs.length === 0) {
@@ -1018,16 +1084,25 @@ function renderTabsBar(nodeRef, container, currentCatalog, onTabChange, refreshC
                             const targetTabId = tab.id;
                             if (payload.sourceTabId !== targetTabId) {
                                 const added = addLoraToTab(nodeRef, targetTabId, payload.loraPath);
+                                
                                 if (added) {
                                     requestAnimationFrame(() => {
-                                        if (targetTabId === config.activeTabId) {
-                                            // Refresh entire grid if dropping on active tab
+                                        // --- OPTIMIZATION: Avoid flicker unless necessary ---
+                                        const isNoTabActive = (nodeRef.properties.searchConfig && 
+                                                               nodeRef.properties.searchConfig.filters && 
+                                                               nodeRef.properties.searchConfig.filters.includes("no_tab"));
+                                        
+                                        // If 'no_tab' filter is ON: The moved LoRA must disappear from the current view (Library).
+                                        // A full refresh is required to re-filter the list.
+                                        if (isNoTabActive) {
                                             if (refreshCallback) refreshCallback();
-                                            else renderTabsBar(nodeRef, container, currentCatalog, onTabChange, refreshCallback);
-                                        } else {
-                                            // Only update badge if dropping on inactive tab
+                                        } 
+                                        // If 'no_tab' filter is OFF: The LoRA stays visible in Library (or we are in another tab).
+                                        // No need to redraw the whole grid. Just update the target tab's counter badge.
+                                        else {
                                             updateTabCounterInPlace(nodeRef, tabBtn, tab, currentCatalog);
                                         }
+                                        // ----------------------------------------------------
                                     });
                                 }
                             }
@@ -1056,16 +1131,33 @@ function renderTabsBar(nodeRef, container, currentCatalog, onTabChange, refreshC
     newTabBtn.onmouseout = function() { this.style.backgroundColor = "transparent"; };
     newTabBtn.onclick = () => { 
         const name = prompt("New tab name:", "New Tab"); 
-        if (name) { createNewTab(nodeRef, name); if (onTabChange) onTabChange(); } 
+        if (name) { 
+            createNewTab(nodeRef, name); 
+            nodeRef._scrollTabsToEnd = true;
+            if (onTabChange) onTabChange(); 
+        } 
     };
     tabBar.appendChild(newTabBtn);
 
     container.appendChild(tabBar);
-    
-    // Restore scroll position if needed
-    if (scrollPosition > 0) {
-        setTimeout(() => { tabBar.scrollTop = scrollPosition; }, 10);
-    }
+}
+
+/**
+ * Returns the URL of the first image in `images` that isn't listed in
+ * `hiddenImages`, or null if there are no images or all of them are hidden.
+ * Shared by the card grid thumbnail, the edit modal's cover-picker default,
+ * and the info modal's cover badge -- so a hidden image is never silently
+ * used as a fallback thumbnail anywhere in the UI.
+ *
+ * @param {Array} images - Array of {url, ...} objects.
+ * @param {Array} hiddenImages - Array of hidden image URLs.
+ * @returns {string|null}
+ */
+function getFirstVisibleImageUrl(images, hiddenImages) {
+    if (!images || images.length === 0) return null;
+    const hiddenSet = new Set(hiddenImages || []);
+    const visible = images.find(img => !hiddenSet.has(img.url));
+    return visible ? visible.url : null;
 }
 
 // ============================================================================
@@ -1080,14 +1172,14 @@ function renderTabsBar(nodeRef, container, currentCatalog, onTabChange, refreshC
  * - Interactive controls: Strength slider, Info modal, Remove button.
  * - Drag & Drop: Reordering within grid, moving between tabs.
  * - Scroll lock during drag operations to prevent layout shifts.
+ * - Maintains scroll position from node properties.
  * 
  * @param {Object} nodeRef - The node instance.
  * @param {Array} fullCatalog - The full LoRA catalog.
  * @param {HTMLElement} container - Parent DOM element.
  * @param {Function} refreshCallback - Callback to refresh the UI.
- * @param {number} scrollPosition - Vertical scroll offset to restore.
  */
-function renderLoraGrid(nodeRef, fullCatalog, container, refreshCallback, scrollPosition = 0) {
+function renderLoraGrid(nodeRef, fullCatalog, container, refreshCallback) {
     const currentTabId = nodeRef.properties.tabsConfig.activeTabId;
     const filteredLoras = getLorasForTab(fullCatalog, nodeRef, currentTabId);
     const currentTab = nodeRef.properties.tabsConfig.tabs.find(t => t.id === currentTabId);
@@ -1096,7 +1188,16 @@ function renderLoraGrid(nodeRef, fullCatalog, container, refreshCallback, scroll
     const gridContainer = document.createElement("div");
     gridContainer.style.cssText = `display:grid; grid-template-columns:repeat(auto-fill, minmax(140px, 1fr)); gap: 15px; padding:15px; overflow-y:auto; flex:1; grid-auto-rows: ${CONFIG.CARD_HEIGHT}; align-content:start; align-items:start; min-height:200px; transition:background 0.2s;`;
     
-    requestAnimationFrame(() => { gridContainer.scrollTop = scrollPosition; });
+    // RESTORE SCROLL POSITION FROM NODE PROPERTIES
+    requestAnimationFrame(() => { 
+        gridContainer.scrollTop = (nodeRef.properties.tabsConfig.gridScrollY || 0); 
+    });
+
+    // SAVE SCROLL POSITION ON CHANGE
+    gridContainer.addEventListener('scroll', () => {
+        nodeRef.properties.tabsConfig.gridScrollY = gridContainer.scrollTop;
+        saveTabsConfig(nodeRef);
+    });
 
     // Scroll Lock Logic: Prevents native scrolling while dragging a card to keep target visible
     let gridScrollLockActive = false;
@@ -1148,9 +1249,9 @@ function renderLoraGrid(nodeRef, fullCatalog, container, refreshCallback, scroll
             } else if (cachedMeta && cachedMeta.coverImage) {
                 imageUrl = cachedMeta.coverImage;     // Priority 2: Selected Cover
             } else if (cachedMeta && cachedMeta.images && cachedMeta.images.length > 0) {
-                imageUrl = cachedMeta.images[0].url;  // Priority 3: Cached First Image
+                imageUrl = getFirstVisibleImageUrl(cachedMeta.images, cachedMeta.hiddenImages); // Priority 3: Cached First Visible Image
             } else if (lora.has_meta && lora.meta && lora.meta.images && lora.meta.images.length > 0) {
-                imageUrl = lora.meta.images[0].url;   // Priority 4: Server First Image
+                imageUrl = getFirstVisibleImageUrl(lora.meta.images, lora.meta.hiddenImages);   // Priority 4: Server First Visible Image
             }
             const hasImages = !!imageUrl;
 
@@ -1426,12 +1527,25 @@ function renderLoraGrid(nodeRef, fullCatalog, container, refreshCallback, scroll
         });
     }
     container.appendChild(gridContainer);
-    if (scrollPosition > 0) setTimeout(() => { gridContainer.scrollTop = scrollPosition; }, 10);
 }
 
 // ============================================================================
 // MODALS & POPUPS
 // ============================================================================
+
+// Stack of currently-open popups' close functions (most recent last).
+// Lets Escape close only the topmost modal when several are stacked
+// (e.g. Info modal opened on top of the floating panel).
+const _popupStack = [];
+
+document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape') return;
+    if (_popupStack.length === 0) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const topClose = _popupStack[_popupStack.length - 1];
+    topClose();
+});
 
 /**
  * Creates a generic modal popup overlay.
@@ -1488,12 +1602,15 @@ function createPopup(contentElement, title, onCloseCallback = null, width = "800
     document.body.appendChild(overlay);
 
     const closePopup = () => {
+        const stackIdx = _popupStack.indexOf(closePopup);
+        if (stackIdx !== -1) _popupStack.splice(stackIdx, 1);
         if (onCloseCallback) onCloseCallback();
         document.removeEventListener('mousedown', handleOutsideClick);
         if (overlay.parentNode) overlay.parentNode.removeChild(overlay);
     };
     
     closeBtn.onclick = closePopup;
+    _popupStack.push(closePopup);
     
     const handleOutsideClick = (e) => { if (overlay === e.target) closePopup(); };
     setTimeout(() => document.addEventListener('mousedown', handleOutsideClick), 10);
@@ -1545,6 +1662,7 @@ function openLoraEditModal(meta, title, loraPath, nodeRef, onSaveCallback) {
         strengthMax: freshData.strengthMax,
         comment: freshData.comment || "",
         images: freshData.images ? [...freshData.images] : [],
+        hiddenImages: freshData.hiddenImages ? [...freshData.hiddenImages] : [],
         civitaiUrl: freshData.civitaiUrl,
         coverImage: freshData.coverImage || null,
         customImageUrl: freshData.customImageUrl || null
@@ -1608,27 +1726,57 @@ function openLoraEditModal(meta, title, loraPath, nodeRef, onSaveCallback) {
             urlGroup.style.cssText = "margin-bottom: 10px;";
             const gridDiv = document.createElement("div");
             gridDiv.style.cssText = `display: grid; grid-template-columns: repeat(auto-fill, minmax(60px, 1fr)); gap: 5px; max-height: 150px; overflow-y: auto; padding: 5px; background: ${CONFIG.COLORS.bg_dark}; border: 1px solid ${CONFIG.COLORS.border_default}; border-radius: 8px;`;
-            const currentCoverUrl = editData.coverImage || (editData.customImageUrl ? editData.customImageUrl : (editData.images[0].url));
+            const currentCoverUrl = editData.coverImage || (editData.customImageUrl ? editData.customImageUrl : getFirstVisibleImageUrl(editData.images, editData.hiddenImages));
 
             editData.images.forEach((img, idx) => {
+                const isHidden = editData.hiddenImages.includes(img.url);
+                const isSelected = (!isHidden && img.url === currentCoverUrl);
+
                 const thumb = document.createElement("div");
-                const isSelected = (img.url === currentCoverUrl);
-                thumb.style.cssText = `aspect-ratio: 1; background: #000; border: ${isSelected ? `2px solid ${CONFIG.COLORS.border_bright_blue}` : `1px solid ${CONFIG.COLORS.border_default}`}; border-radius: 3px; overflow: hidden; cursor: pointer; opacity: ${isSelected ? '1' : '0.7'};`;
+                thumb.style.cssText = `position: relative; aspect-ratio: 1; background: #000; border: ${isSelected ? `2px solid ${CONFIG.COLORS.border_bright_blue}` : `1px solid ${CONFIG.COLORS.border_default}`}; border-radius: 3px; overflow: hidden; cursor: ${isHidden ? 'default' : 'pointer'}; opacity: ${isHidden ? '0.35' : (isSelected ? '1' : '0.7')};`;
+
                 const imgEl = document.createElement("img");
                 imgEl.src = img.url;
                 imgEl.style.cssText = "width: 100%; height: 100%; object-fit: cover;";
                 thumb.appendChild(imgEl);
-                thumb.onclick = () => {
-                    editData.coverImage = img.url;
-                    editData.customImageUrl = null;
-                    customUrlInput.value = "";
+
+                if (!isHidden) {
+                    thumb.onclick = () => {
+                        editData.coverImage = img.url;
+                        editData.customImageUrl = null;
+                        customUrlInput.value = "";
+                        renderForm();
+                    };
+                } else {
+                    thumb.title = "Hidden from the Info modal. Click the eye icon to show it again.";
+                }
+
+                // Hide/Show toggle -- independent of the cover-selection click above.
+                const toggleBtn = document.createElement("button");
+                toggleBtn.innerText = isHidden ? "🙈" : "👁";
+                toggleBtn.title = isHidden ? "Hidden from the Info modal — click to show" : "Click to hide from the Info modal";
+                toggleBtn.style.cssText = `position: absolute; top: 2px; right: 2px; width: 18px; height: 18px; padding: 0; border: none; border-radius: 3px; background: rgba(0,0,0,0.65); color: #fff; font-size: 11px; line-height: 18px; cursor: pointer; display: flex; align-items: center; justify-content: center; z-index: 5;`;
+                toggleBtn.onclick = (e) => {
+                    e.preventDefault(); e.stopPropagation();
+                    if (isHidden) {
+                        editData.hiddenImages = editData.hiddenImages.filter(u => u !== img.url);
+                    } else {
+                        editData.hiddenImages.push(img.url);
+                        // If we just hid the currently-selected cover, drop it so the
+                        // form falls back to the next visible image instead of
+                        // silently keeping a now-hidden image as the cover.
+                        if (editData.coverImage === img.url) editData.coverImage = null;
+                        if (editData.customImageUrl === img.url) { editData.customImageUrl = null; customUrlInput.value = ""; }
+                    }
                     renderForm();
                 };
+                thumb.appendChild(toggleBtn);
+
                 gridDiv.appendChild(thumb);
             });
             imageSection.appendChild(gridDiv);
             const helpText = document.createElement("div");
-            helpText.innerText = "Click on thumbnail to set as cover";
+            helpText.innerText = "Click a thumbnail to set as cover. Click 👁 to hide an image from the Info modal (e.g. NSFW previews).";
             helpText.style.cssText = `font-size: 10px; color: ${CONFIG.COLORS.text_faded}; margin-top: 5px; text-align: center;`;
             imageSection.appendChild(helpText);
         }
@@ -1742,6 +1890,9 @@ function openLoraEditModal(meta, title, loraPath, nodeRef, onSaveCallback) {
                         loraObj.meta.trainedWords = editData.trainedWords;
                         loraObj.display_name = editData.name || loraObj.display_name;
                     }
+
+                    // Clamp the card's active strength to the newly saved min/max range
+                    clampCardStrengthToRange(nodeRef, loraPath, editData.strengthMin, editData.strengthMax, loraObj);
                     
                     syncLoraDataToWidget(nodeRef);
                     if (window.neuradRefreshCallback) window.neuradRefreshCallback();
@@ -1868,15 +2019,16 @@ function openLoraInfoModal(meta, title, loraPath = null, nodeRef) {
         }
 
         // 2. Images Gallery
-        if (dataToDisplay.images && dataToDisplay.images.length > 0) {
+        const visibleImages = (dataToDisplay.images || []).filter(img => !(dataToDisplay.hiddenImages || []).includes(img.url));
+        if (visibleImages.length > 0) {
             const sectionDiv = document.createElement("div");
             sectionDiv.innerHTML = "<strong>Images:</strong>";
             const scrollContainer = document.createElement("div");
             scrollContainer.style.cssText = `display: flex; flex-direction: row; gap: 10px; overflow-x: auto; overflow-y: hidden; padding: 10px 0; width: 100%;margin: 0 auto; scrollbar-width: thin; scrollbar-color:${CONFIG.COLORS.bg_button} ${CONFIG.COLORS.bg_dark}; box-sizing: border-box;`;
             
-            const currentCoverUrl = dataToDisplay.customImageUrl || dataToDisplay.coverImage || (dataToDisplay.images[0] ? dataToDisplay.images[0].url : null);
+            const currentCoverUrl = dataToDisplay.customImageUrl || dataToDisplay.coverImage || getFirstVisibleImageUrl(dataToDisplay.images, dataToDisplay.hiddenImages);
 
-            dataToDisplay.images.forEach((img, index) => {
+            visibleImages.forEach((img, index) => {
                 const imgWrapper = document.createElement("div");
                 imgWrapper.style.cssText = "flex: 0 0 auto; display: flex; flex-direction: column; background: transparent; border-radius: 8px; overflow: hidden; border: 1px solid #333; position: relative; max-width: 100%;";
                 
@@ -2075,12 +2227,98 @@ function enforceMinSize(node, immediate = false) {
 }
 
 /**
+ * FAIL-SAFE: Validates every entry in the node's activeLorasMap against the real,
+ * freshly-loaded catalog from disk. An entry is considered orphaned/corrupted if:
+ *   - No file in the catalog matches its relative_path anymore (deleted/moved/renamed), OR
+ *   - The stored entry itself is malformed (missing the fields needed to re-toggle it
+ *     off or to serialize it to the backend: `name`, and a numeric `strength`).
+ *
+ * Any orphaned entry is purged from activeLorasMap AND from the metadata cache
+ * (LocalCache), so it is dropped entirely and treated as a brand-new LoRA the next
+ * time it (or a file with the same name) shows up in the catalog. This prevents the
+ * "stuck active LoRA with no card to turn it off" situation.
+ *
+ * Must be called AFTER `nodeRef.properties._fullLoraCatalog` has been populated with
+ * a fresh catalog (i.e. right after loadLoraList() resolves), since that's the only
+ * moment we actually know which files exist on disk.
+ *
+ * @param {Object} nodeRef - The node instance.
+ * @param {Array} fullCatalog - The freshly loaded LoRA catalog.
+ * @returns {Array<string>} The list of purged keys (empty if nothing was corrupted).
+ */
+function purgeOrphanedActiveLoras(nodeRef, fullCatalog) {
+    const activeMap = nodeRef.properties.activeLorasMap;
+    if (!activeMap || !Array.isArray(fullCatalog)) return [];
+
+    const catalogPaths = new Set(fullCatalog.filter(l => l && l.relative_path).map(l => l.relative_path));
+    const purgedKeys = [];
+
+    for (const key of Object.keys(activeMap)) {
+        const entry = activeMap[key];
+        const fileExists = catalogPaths.has(key);
+        const entryIsWellFormed = entry && typeof entry.name === 'string' && entry.name.length > 0 && typeof entry.strength === 'number' && !isNaN(entry.strength);
+
+        if (!fileExists || !entryIsWellFormed) {
+            purgedKeys.push(key);
+            delete activeMap[key];
+            if (typeof LocalCache !== 'undefined') LocalCache.delete(key);
+        }
+    }
+
+    if (purgedKeys.length > 0) {
+        console.warn(`[Neurad] Fail-safe: purged ${purgedKeys.length} orphaned/corrupted active LoRA entr${purgedKeys.length === 1 ? 'y' : 'ies'}:`, purgedKeys);
+        syncLoraDataToWidget(nodeRef);
+    }
+
+    return purgedKeys;
+}
+
+/**
  * Synchronizes the active LoRA state from the node's internal map to the hidden widget.
  * This ensures the data is passed correctly to the backend when the workflow runs.
  * Also updates the cached display names for the node's background rendering.
  * 
  * @param {Object} nodeRef - The ComfyUI node instance.
  */
+/**
+ * Clamps a card's active strength (in nodeRef.properties.activeLorasMap) to
+ * the given [strengthMin, strengthMax] range, defaulting the baseline to 1.0
+ * if no active entry exists yet. Shared by both the edit-modal Save handler
+ * and the initial CivitAI auto-fetch, so a freshly-fetched recommendation is
+ * applied immediately rather than only once the user opens/saves the modal.
+ * Does nothing if neither bound is a valid number. Does NOT call
+ * syncLoraDataToWidget itself -- callers should do that afterward if needed.
+ *
+ * @param {Object} nodeRef - The node instance.
+ * @param {string} loraPath - The LoRA's relative_path (activeLorasMap key).
+ * @param {number|null} strengthMin
+ * @param {number|null} strengthMax
+ * @param {Object} [loraObj] - Optional catalog entry, used for name/subfolder when creating a new entry.
+ */
+function clampCardStrengthToRange(nodeRef, loraPath, strengthMin, strengthMax, loraObj) {
+    const hasMin = (typeof strengthMin === 'number' && !isNaN(strengthMin));
+    const hasMax = (typeof strengthMax === 'number' && !isNaN(strengthMax));
+    if (!hasMin && !hasMax) return;
+
+    const activeMap = nodeRef.properties.activeLorasMap || (nodeRef.properties.activeLorasMap = {});
+    const existingState = activeMap[loraPath];
+    let newStrength = (existingState && typeof existingState.strength === 'number') ? existingState.strength : 1.0;
+
+    if (hasMin && newStrength < strengthMin) newStrength = strengthMin;
+    if (hasMax && newStrength > strengthMax) newStrength = strengthMax;
+
+    if (existingState) {
+        existingState.strength = newStrength;
+    } else {
+        activeMap[loraPath] = {
+            on: false,
+            strength: newStrength,
+            name: loraObj ? loraObj.name : undefined,
+            subfolder: loraObj ? loraObj.subfolder : undefined
+        };
+    }
+}
+
 function syncLoraDataToWidget(nodeRef) {
     const loraMap = nodeRef.properties.activeLorasMap || {};
     const fullCatalog = nodeRef.properties._fullLoraCatalog || [];
@@ -2329,6 +2567,10 @@ function createFloatingPanel(nodeRef) {
             nodeRef.properties._fullLoraCatalog = fullCatalog;
             console.log(`[Neurad] Catalog loaded: ${fullCatalog.length} LoRAs.`);
 
+            // FAIL-SAFE: drop any "active" LoRA that no longer has a matching file
+            // (or whose stored entry is malformed) so it can't get permanently stuck on.
+            purgeOrphanedActiveLoras(nodeRef, fullCatalog);
+
             // Remove loading indicator
             if (loadingDiv.parentNode) contentBody.removeChild(loadingDiv);
 
@@ -2343,28 +2585,21 @@ function createFloatingPanel(nodeRef) {
             }
             const config = nodeRef.properties.searchConfig;
             if (!Array.isArray(config.filters)) config.filters = [];
-            const validFilters = ["on", "off", "has_meta", "no_meta"];
+            // --- UPDATED: Added "no_tab" to the list of valid filters ---
+            const validFilters = ["on", "off", "has_meta", "no_meta", "no_tab"];
+            // -----------------------------------------------------------
             config.filters = config.filters.filter(f => validFilters.includes(f));
 
             // Define Refresh UI Function
             const refreshUI = () => {
-                // Preserve scroll positions
-                const tabBarElement = mainContainer.querySelector('.neurad-tab-bar');
-                const savedTabScroll = (tabBarElement) ? tabBarElement.scrollLeft : 0;
-                let savedGridScroll = 0;
-                const currentGridContainer = mainContainer.lastElementChild;
-                if (currentGridContainer && currentGridContainer !== purgeBtn) {
-                    if (currentGridContainer.scrollHeight > currentGridContainer.clientHeight) {
-                        savedGridScroll = currentGridContainer.scrollTop;
-                    }
-                }
-                
                 // Build new content in a detached fragment (prevents flickering)
                 const staging = document.createElement("div");
                 staging.appendChild(purgeBtn);
+                
+                // Render components: Scroll positions are now handled internally by reading nodeRef.properties
                 renderSearchBar(nodeRef, staging, fullCatalog, refreshUI);
-                renderTabsBar(nodeRef, staging, fullCatalog, refreshUI, refreshUI, savedTabScroll);
-                renderLoraGrid(nodeRef, fullCatalog, staging, refreshUI, savedGridScroll);
+                renderTabsBar(nodeRef, staging, fullCatalog, refreshUI, refreshUI); 
+                renderLoraGrid(nodeRef, fullCatalog, staging, refreshUI);
 
                 // Atomic swap
                 mainContainer.replaceChildren(...staging.childNodes);
@@ -2437,8 +2672,13 @@ async function triggerFetchSingleInfo(nodeRef, lora, containerElement, refreshCa
             // 2. Update in-memory object for immediate UI reflection
             lora.has_meta = true;
             lora.meta = result.meta;
+
+            // 3. Snap the card's active strength into the freshly-fetched range
+            //    right away, rather than waiting for an edit-modal Save.
+            clampCardStrengthToRange(nodeRef, lora.relative_path, result.meta.strengthMin, result.meta.strengthMax, lora);
+            syncLoraDataToWidget(nodeRef);
             
-            // 3. Refresh UI
+            // 4. Refresh UI
             if (refreshCallback) {
                 refreshCallback(); 
             }
@@ -2572,6 +2812,8 @@ app.registerExtension({
 
                 // --- BACKGROUND RENDERING (List of Active LoRAs) ---
                 this.onDrawBackground = function(ctx) {
+                    if (this.flags && this.flags.collapsed) return;
+
                     const names = this.properties._cachedActiveDisplayNames || [];
                     ctx.save();
                     ctx.font = "12px sans-serif";

@@ -82,7 +82,7 @@ Neurad Visual LoRA Loader replaces the standard text-based LoRA selection with a
 *   **Activate/Deactivate:** Click anywhere on a card to toggle it On/Off.
 *   **Adjust Strength:** Use the `◄` / `►` buttons or click the number to type a specific strength value.
 *   **Get Info:** If a card shows a "📥 Get Info" placeholder, click it to fetch metadata from CivitAI.
-*   **Edit Details:** Click the **ℹ️** icon on a card to view details. Inside the modal, click **✏️ Edit** to manually change names, trigger words, cover images, or recommended strength.
+*   **Edit Details:** Click the **ℹ️** icon on a card to view details. Inside the modal, click **✏️ Edit** to manually change names, trigger words, cover images, images visibility, or recommended strength.
 *   **Image Details:** Inside the modal, click an image to zoom in. Images displaying the **📝** icon include available generation metadata.
 *   **Trigger Words:** Inside the modal, you can select multiple trigger words simultaneously; they are automatically copied to the clipboard as a comma-separated list.
 
@@ -94,7 +94,7 @@ Neurad Visual LoRA Loader replaces the standard text-based LoRA selection with a
 
 ### 4. Filtering Results
 *   **Search Field:** Enter any string to include or exclude it. Words are tested individually against LoRA names, filenames, and paths.
-*   **Filter Buttons:** Select **On/Off** and/or **Has Meta/No Meta** to further refine your search.
+*   **Filter Buttons:** Select **On/Off** and/or **Has Meta/No Meta**  and/or **Not Assigned** to further refine your search.
 *   **Consistent Results:** Displayed LoRAs will always satisfy all specified criteria simultaneously.
 *   **Automatic NSFW Filtering:** "nsfw" is a pre-activated negative keyword. It automatically hides any LoRA with "nsfw" in its name, filename, or path. To display these LoRAs, explicitly include "nsfw" in the positive search field.
 
@@ -122,18 +122,15 @@ Understanding the separation between **Global Data** and **Node Configuration** 
 ## ⚙️ Technical Details
 
 ### Data Persistence
-The extension uses a robust dual-layer storage system:
-1.  **Browser LocalStorage:** Used for immediate read/write access during your session.
-2.  **Server Disk Backup:** A debounced backup system writes your changes to the server's disk. If you clear your browser cache, the extension will automatically offer to restore your data from the server backup upon the next launch.
+*	**Server Disk Backup:** A debounced backup system writes your changes to the server's disk.
 
 ### Caching System
 *   **Image Cache:** Keeps up to 800 images in memory to prevent flickering and reduce network requests.
-*   **Metadata Cache:** Stores fetched CivitAI data locally to avoid hitting API rate limits.
 
 ### Clearing Cache
 A hidden **"⚠️ Clear Cache"** button is available in the top-left of the modal.
 *   **How to access:** Hover over the button for **1 second**. It will turn red and become clickable.
-*   **Action:** This wipes both local browser storage and server-side backup files. Use with caution.
+*   **Action:** This wipes server-side backup files. Use with caution.
 
 ---
 
@@ -160,6 +157,7 @@ This project is licensed under the **MIT License** - see the [LICENSE](LICENSE) 
 *   Built for the **ComfyUI** community.
 *   Metadata powered by **CivitAI**.
 *   Inspired by the need for better asset management in AI art workflows.
+*	Built using LLMs Euria and Claude.
 
 ---
 
