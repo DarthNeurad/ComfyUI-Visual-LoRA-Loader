@@ -37,12 +37,27 @@ Neurad Visual LoRA Loader replaces the standard text-based LoRA selection with a
 
 ## 📸 Screenshots
 
-*(Add your screenshots here in the `images/` folder and reference them below)*
-
 | Visual Grid & Tabs | Metadata Editor |
 | :---: | :---: |
 | ![Grid View](./images/screenshot_grid.png) | ![Editor Modal](./images/screenshot_editor.png) |
 | *Browse and organize your library visually.* | *Edit trigger words, strengths, and cover images.* |
+
+| CivitAI Integration | Metadata Editor |
+| :---: | :---: |
+| ![CivitAI Fetch](./images/Get-Info-Activate.gif) | ![Metadata Info Edit](./images/Info-Edit-Panel.gif) |
+| *Fetch metadata from CivitAI or activate cards individually.* | *Inspect metadata details and edit them directly in the modal.* |
+
+| Basic Tab Functions | Advanced Tab Functions |
+| :---: | :---: |
+| ![Tabs Basic](./images/Basic-Tab.gif) | ![Tabs Advanced](./images/Advanced-Tab.gif) |
+| *Create custom tabs and assign cards to them.* | *Rename, reorder, and manage tab organization.* |
+
+| Search with String | Filter Results |
+| :---: | :---: |
+| ![Search String](./images/Search.gif) | ![Filter Results](./images/Filters.gif) |
+| *Find LoRAs instantly using positive or negative strings.* | *Refine library views with dynamic filtering options.* |
+
+
 
 ---
 
